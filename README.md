@@ -21,9 +21,9 @@ No installation step. Copy `sca_prioritize.py` into your working directory.
 ### From Source
 
 ```bash
-git clone <your-repo-url>
-cd <repo>
-python3 sca_prioritize.py --help
+git clone https://github.com/moonkit02/prio-logic
+cd prio-logic
+python3 sca_prioritize.py
 ```
 
 ## Configuration
