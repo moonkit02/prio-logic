@@ -1,31 +1,33 @@
 """
-SCA Vulnerability Prioritization
-=================================
-Post-processes an OWASP Dependency-Check report into four ranked tiers (P1-P4)
-so the queue answers "which vulnerabilities need fixing now."
+SBOM Vulnerability Prioritization  (Trivy)
+==========================================
+Parallel to sca-logic.py, but the input is a Trivy SBOM/vuln-scan report
+(Results[].Vulnerabilities[]) instead of an OWASP Dependency-Check report.
+The prioritization engine is identical:
 
-The model — ONE pipeline, four stages (every prio-logic script shares this shape):
+  1. Read the Trivy JSON (default: SBOM.json in the current directory).
+  2. For each vulnerability, extract security-risk signals.
+  3. Assign a priority 1-4:
+       Priority 1 = EMERGENCY  - fix now
+       Priority 2 = URGENT     - fix soon
+       Priority 3 = PLAN       - schedule
+       Priority 4 = MONITOR    - accept / watch
+  4. Apply exposure mode (how hard to downgrade non-network findings).
+  5. Output to CLI and to filtered-sbom.json.
 
-    extract -> [1] OVERRIDES -> [2] BASE TIER -> [3] DOWNGRADES -> output
+Signals used:
+  - CWE            (malicious-code / supply-chain override)
+  - CISA KEV       (confirmed exploitation override)
+  - CVSS base      (severity floor)
+  - EPSS v4        (exploitation probability)
+  - attackVector   (exposure proxy: NETWORK vs LOCAL/NONE)
 
-  Stage 1  OVERRIDES   a *confirmed* fact hard-sets the tier and returns early,
-                       immune to everything below.
-                         - KEV       -> P1 (confirmed exploited in the wild)
-                         - CWE-506    -> P1 (confirmed malicious code)
-  Stage 2  BASE TIER   the "how bad x how likely" axes set a starting tier.
-                         - CVSS x EPSS (both gates must hold), else fall back to
-                           the report's severity.
-  Stage 3  DOWNGRADES  proxies that only ever DEMOTE, never escalate, and never
-                       touch a Stage-1 override.
-                         - attackVector exposure modifier (mode-controlled).
-  Stage 4  OUTPUT      tiers + reasons, per-package grouping, CLI + filtered JSON.
-
-Signals: CWE (malicious-code override), CISA KEV (exploitation override),
-CVSS base (severity), EPSS v4 (exploitation probability), attackVector (exposure).
-
-EPSS and KEV are CVE-keyed; Dependency-Check npm output is GHSA-keyed, so extract
-recovers the CVE alias first. EPSS/KEV calls live in Enricher; an unreachable
-feed fails safe to an empty map and that finding falls back to severity tiering.
+Trivy keys VulnerabilityID on the CVE directly, so no GHSA->CVE recovery is
+needed in the common case; GHSA-only findings (no CVE) fall back to severity.
+CVSS may carry several sources (nvd/ghsa/redhat) -- nvd is preferred, then
+ghsa, then redhat. attackVector is parsed from the chosen V3Vector string.
+EPSS/KEV calls are isolated in Enricher; if a feed is unreachable it fails
+safe to an empty map and that finding falls back to severity-based tiering.
 """
 
 from __future__ import annotations
@@ -42,40 +44,39 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Config — tunable thresholds, grouped by the stage that uses them.
-# Not frozen constants: EPSS recalibrates between model versions.
+# Tunable thresholds — keep as config, NOT frozen constants.
+# EPSS recalibrates between model versions; a version bump shifts tiers.
 # ---------------------------------------------------------------------------
 CONFIG = {
-    # Stage 1 — overrides
-    # CWE-506 unambiguously means embedded malicious code (Snyk labels every
-    # malicious package with it). CWE-829/1357 describe risky-but-legitimate
-    # patterns, so they are excluded to avoid false P1s.
+    "epss_p1": 0.70,
+    "epss_p2": 0.40,
+    "epss_p3": 0.10,
+    "cvss_p1": 9.0,
+    "cvss_p2": 7.0,
+    "cvss_p3": 4.0,
+    # Malicious-code CWEs -> emergency override (see sca-logic.py for rationale).
     "malicious_cwes": {"CWE-506"},
-    # Stage 2 — base tier (CVSS x EPSS quadrant; both gates must hold)
-    "cvss_p1": 9.0, "epss_p1": 0.70,
-    "cvss_p2": 7.0, "epss_p2": 0.40,
-    "cvss_p3": 4.0, "epss_p3": 0.10,
-    # Stage 3 — downgrades
-    "exposed_vectors": {"NETWORK", "ADJACENT_NETWORK"},   # remotely reachable
-    # Floor — a critical CVSS never sits below P2, even on low EPSS or after the
-    # exposure downgrade. CVSS 9.0-10.0 is the "Critical" band; too severe to defer.
-    "cvss_floor": 9.0,
+    # Remotely-reachable attack vectors (exposure proxy).
+    "exposed_vectors": {"NETWORK", "ADJACENT_NETWORK"},
+    # CVSS source preference when a finding carries several.
+    "cvss_source_order": ("nvd", "ghsa", "redhat"),
 }
 
 # ---------------------------------------------------------------------------
-# Stage 3 exposure modes. Named by THREAT MODEL, not by "more/fewer alerts".
-#   local_downgrade = tiers a non-network finding drops. Overrides are immune.
-# Evidence: network-vector ~= 71.6% of CVEs (2021-2024, S2W); local vulns still
-# matter in post-compromise chains, so they are downgraded, not dismissed.
+# Exposure modes — identical semantics to sca-logic.py.
+#   local_downgrade = how many tiers a non-network finding drops.
+# Hard overrides (KEV, malicious-CWE) are immune to this in all modes.
 # ---------------------------------------------------------------------------
 EXPOSURE_MODES = {
-    "balanced":        {"local_downgrade": 1},   # evidence-backed middle (internal apps)
+    "balanced":        {"local_downgrade": 1},   # internal apps
     "network_focused": {"local_downgrade": 2},   # default; target is a network-facing web app
-    "vector_agnostic": {"local_downgrade": 0},   # internal tools / distrust signal
+    "vector_agnostic": {"local_downgrade": 0},
 }
 DEFAULT_MODE = "network_focused"
 
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}")
+AV_RE = re.compile(r"AV:([NALP])")
+AV_MAP = {"N": "NETWORK", "A": "ADJACENT_NETWORK", "L": "LOCAL", "P": "PHYSICAL"}
 
 
 # ---------------------------------------------------------------------------
@@ -98,18 +99,20 @@ class Priority(IntEnum):
 
 
 # ---------------------------------------------------------------------------
-# Extracted signals per finding
+# Step 2 output: extracted signals per finding
 # ---------------------------------------------------------------------------
 @dataclass
 class Finding:
     package: str
-    advisory_id: str            # GHSA-xxxx or CVE-xxxx
-    source: str
-    severity: str               # critical / high / moderate / low
+    advisory_id: str            # CVE-xxxx (Trivy VulnerabilityID) or GHSA-xxxx
+    source: str                 # SeveritySource
+    severity: str               # critical / high / medium / low
     cvss: Optional[float]
     attack_vector: str          # NETWORK / LOCAL / NONE / ...
     cwes: list[str]
-    cve: Optional[str] = None   # recovered alias
+    installed_version: str = ""
+    fixed_version: str = ""
+    cve: Optional[str] = None
     epss: Optional[float] = None
     kev: bool = False
     priority: Optional[Priority] = None
@@ -117,52 +120,66 @@ class Finding:
 
 
 # ===========================================================================
-# STEP 1 — load the report (default: report.json in current directory)
+# STEP 1 — read the Trivy report (default: SBOM.json in current directory)
 # ===========================================================================
-def load_report(path: str = "report.json") -> dict:
+def load_report(path: str = "SBOM.json") -> dict:
     with open(path) as fh:
         return json.load(fh)
 
 
 # ===========================================================================
-# STEP 2 — extract signals from each finding
+# STEP 2 — extract security-risk signals from each vulnerability
 # ===========================================================================
 def extract_signals(report: dict) -> list[Finding]:
     findings: list[Finding] = []
-    for dep in report.get("dependencies", []):
-        pkg = dep.get("fileName", "unknown")
-        for v in dep.get("vulnerabilities", []):
-            cvssv3 = v.get("cvssv3") or {}
-            cvss = round(float(cvssv3["baseScore"]), 1) if "baseScore" in cvssv3 else None
-            av = (cvssv3.get("attackVector") or "NONE").upper()
-            name = v.get("name", "")
+    for res in report.get("Results", []):
+        for v in res.get("Vulnerabilities") or []:
+            cvss, av = _pick_cvss(v.get("CVSS") or {})
+            name = v.get("VulnerabilityID", "")
             f = Finding(
-                package=pkg,
+                package=v.get("PkgName", "unknown"),
                 advisory_id=name,
-                source=v.get("source", ""),
-                severity=(v.get("severity") or "unknown").lower(),
+                source=v.get("SeveritySource", ""),
+                severity=(v.get("Severity") or "unknown").lower(),
                 cvss=cvss,
                 attack_vector=av,
-                cwes=list(v.get("cwes", [])),
+                cwes=list(v.get("CweIDs", [])),
+                installed_version=v.get("InstalledVersion", ""),
+                fixed_version=v.get("FixedVersion", ""),
             )
             f.cve = _recover_cve(name, v)
             findings.append(f)
     return findings
 
 
+def _pick_cvss(cvss_block: dict) -> tuple[Optional[float], str]:
+    """Choose one (score, attackVector) from possibly several CVSS sources.
+    Preference: nvd > ghsa > redhat > any-with-a-score. attackVector comes
+    from the same source's V3Vector; missing vector -> 'NONE' (mirrors sca)."""
+    order = list(CONFIG["cvss_source_order"]) + [
+        s for s in cvss_block if s not in CONFIG["cvss_source_order"]]
+    for src in order:
+        entry = cvss_block.get(src) or {}
+        if "V3Score" in entry:
+            score = round(float(entry["V3Score"]), 1)
+            vec = entry.get("V3Vector") or ""
+            m = AV_RE.search(vec)
+            return score, AV_MAP.get(m.group(1), "NONE") if m else "NONE"
+    return None, "NONE"
+
+
 def _recover_cve(name: str, vuln: dict) -> Optional[str]:
     if name.startswith("CVE-"):
         return name
-    blob = json.dumps(vuln.get("references", [])) + " " + (vuln.get("description") or "")
+    blob = (json.dumps(vuln.get("VendorIDs", [])) + " "
+            + json.dumps(vuln.get("References", [])) + " "
+            + (vuln.get("Description") or ""))
     m = CVE_RE.search(blob)
     return m.group(0) if m else None
 
 
 # ---------------------------------------------------------------------------
-# Enrichment — the only network-touching part.
-#   EPSS: GET api.first.org/data/v1/epss?cve=...  (batch 100/req)
-#   KEV : GET CISA known_exploited_vulnerabilities.json -> a set
-# Unreachable -> empty map; lookups no-op and logic falls back to severity.
+# Enrichment — the only network-touching part.  (identical to sca-logic.py)
 # ---------------------------------------------------------------------------
 class Enricher:
     def __init__(self, epss_map: dict[str, float] | None = None,
@@ -178,6 +195,9 @@ class Enricher:
         f.kev = f.cve in self.kev_set
 
 
+# ---------------------------------------------------------------------------
+# Live feed loaders (network). KEV caches to disk; both fail safe to empty.
+# ---------------------------------------------------------------------------
 KEV_URL = ("https://www.cisa.gov/sites/default/files/feeds/"
            "known_exploited_vulnerabilities.json")
 EPSS_URL = "https://api.first.org/data/v1/epss"
@@ -197,7 +217,7 @@ def load_kev_set(use_cache: bool = True) -> set[str]:
             except Exception:
                 pass
     try:
-        req = urllib.request.Request(KEV_URL, headers={"User-Agent": "sca-prioritize"})
+        req = urllib.request.Request(KEV_URL, headers={"User-Agent": "sbom-prioritize"})
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.load(r)
         cves = {v["cveID"] for v in data.get("vulnerabilities", [])}
@@ -223,7 +243,7 @@ def load_epss_map(cves: list[str]) -> dict[str, float]:
         q = urllib.parse.urlencode({"cve": ",".join(batch)})
         url = f"{EPSS_URL}?{q}"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "sca-prioritize"})
+            req = urllib.request.Request(url, headers={"User-Agent": "sbom-prioritize"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 data = json.load(r)
             for row in data.get("data", []):
@@ -243,80 +263,49 @@ def build_live_enricher(findings: list[Finding]) -> Enricher:
 
 
 # ===========================================================================
-# STEP 3 — assign priority: the 4-stage model
+# STEP 3 — assign priority 1-4   (STEP 4 exposure mode applied at the end)
 # ===========================================================================
 def assign_priority(f: Finding, mode: str = DEFAULT_MODE, cfg: dict = CONFIG) -> Finding:
-    # Stage 1 — OVERRIDES: a confirmed fact hard-sets the tier, immune to Stage 3.
-    override = _stage1_override(f, cfg)
-    if override is not None:
-        return _set(f, *override)
-
-    # Stage 2 — BASE TIER: the how-bad x how-likely axes.
-    p = _stage2_base_tier(f, cfg)
-
-    # Stage 3 — DOWNGRADES: proxies that only ever demote.
-    p = _stage3_downgrades(f, p, mode, cfg)
-
-    # Floor — a critical CVSS is held at P2 minimum (applied after downgrades).
-    p = _floor_high_cvss(f, p, cfg)
-
-    f.priority = p
-    return f
-
-
-def _stage1_override(f: Finding, cfg: dict) -> Optional[tuple[Priority, str]]:
-    """Confirmed-true signals -> P1 unconditionally. None if no override applies."""
+    # --- Priority 1 overrides (emergency). Immune to exposure mode. ---
     if f.kev:
-        return Priority.P1, "[override] CISA KEV: confirmed exploited in the wild"
+        return _set(f, Priority.P1, "CISA KEV: confirmed exploited in the wild")
     mal = set(f.cwes) & cfg["malicious_cwes"]
     if mal:
-        return Priority.P1, f"[override] malicious-code CWE: {', '.join(sorted(mal))}"
-    return None
+        return _set(f, Priority.P1, f"Malicious-code CWE: {', '.join(sorted(mal))}")
 
-
-def _stage2_base_tier(f: Finding, cfg: dict) -> Priority:
-    """CVSS x EPSS quadrant (both gates must hold); else severity fallback."""
+    # --- Three-signal path (when EPSS available) ---
     if f.epss is not None and f.cvss is not None:
         if f.cvss >= cfg["cvss_p1"] and f.epss >= cfg["epss_p1"]:
-            p, why = Priority.P1, "critical sev, high exploit prob"
+            _set(f, Priority.P1, f"CVSS {f.cvss} + EPSS {f.epss:.2f} (critical sev, high exploit prob)")
         elif f.cvss >= cfg["cvss_p2"] and f.epss >= cfg["epss_p2"]:
-            p, why = Priority.P2, "high sev, moderate exploit prob"
+            _set(f, Priority.P2, f"CVSS {f.cvss} + EPSS {f.epss:.2f} (high sev, moderate exploit prob)")
         elif f.cvss >= cfg["cvss_p3"] and f.epss >= cfg["epss_p3"]:
-            p, why = Priority.P3, "moderate"
+            _set(f, Priority.P3, f"CVSS {f.cvss} + EPSS {f.epss:.2f} (moderate)")
         else:
-            p, why = Priority.P4, "below thresholds"
-        f.reasons.append(f"[base] CVSS {f.cvss} + EPSS {f.epss:.2f} ({why}) -> {p.name}")
-        return p
-    # Fallback: no EPSS (no recoverable CVE, or CVE not scored)
-    p = {
-        "critical": Priority.P2, "high": Priority.P2,
-        "moderate": Priority.P3, "low": Priority.P4,
-    }.get(f.severity, Priority.P4)
-    f.reasons.append(f"[base] no EPSS; tiered by severity='{f.severity}' -> {p.name}")
-    return p
+            _set(f, Priority.P4, f"CVSS {f.cvss} + EPSS {f.epss:.2f} (below thresholds)")
+    else:
+        # --- Fallback: no EPSS (no recoverable CVE, or CVE not scored) ---
+        # Trivy uses 'medium' where Dependency-Check uses 'moderate' — handle both.
+        sev_tier = {
+            "critical": Priority.P2,
+            "high": Priority.P2,
+            "moderate": Priority.P3,
+            "medium": Priority.P3,
+            "low": Priority.P4,
+        }.get(f.severity, Priority.P4)
+        _set(f, sev_tier, f"No EPSS; tiered by severity='{f.severity}'")
 
-
-def _stage3_downgrades(f: Finding, p: Priority, mode: str, cfg: dict) -> Priority:
-    """Exposure modifier: non-network findings drop tiers (downgrade only)."""
+    # --- STEP 4: exposure modifier (mode-controlled, downgrade only) ---
     downgrade = EXPOSURE_MODES.get(mode, EXPOSURE_MODES[DEFAULT_MODE])["local_downgrade"]
     if downgrade and f.attack_vector not in cfg["exposed_vectors"]:
-        new = Priority(min(int(p) + downgrade, int(Priority.P4)))
-        if new != p:
+        before = f.priority
+        new_val = min(int(f.priority) + downgrade, int(Priority.P4))
+        if new_val != int(f.priority):
+            f.priority = Priority(new_val)
             f.reasons.append(
-                f"[downgrade] exposure[{mode}]: attackVector={f.attack_vector} "
-                f"(not network-exposed) {p.name}->{new.name}")
-            p = new
-    return p
-
-
-def _floor_high_cvss(f: Finding, p: Priority, cfg: dict) -> Priority:
-    """A critical CVSS never sits below P2. Runs after downgrades, so a low EPSS or
-    a non-network attackVector cannot sink a CVSS>=9 finding to P3/P4. Does not touch
-    P1 (already higher) or the KEV / CWE-506 overrides (they return before this)."""
-    if f.cvss is not None and f.cvss >= cfg["cvss_floor"] and int(p) > int(Priority.P2):
-        f.reasons.append(f"[floor] CVSS {f.cvss} >= {cfg['cvss_floor']}: held at P2 (was {p.name})")
-        return Priority.P2
-    return p
+                f"exposure[{mode}]: attackVector={f.attack_vector} "
+                f"(not network-exposed) -> {before.name}->{f.priority.name}")
+    return f
 
 
 def _set(f: Finding, p: Priority, reason: str) -> Finding:
@@ -336,6 +325,7 @@ class PackageGroup:
     top_cvss: Optional[float]
     any_kev: bool
     any_malicious: bool
+    fix_versions: list[str]
     reasons: list[str]
 
 
@@ -354,6 +344,7 @@ def group_by_package(findings: list[Finding]) -> list[PackageGroup]:
             top_cvss=max((f.cvss for f in fs if f.cvss is not None), default=None),
             any_kev=any(f.kev for f in fs),
             any_malicious=any(set(f.cwes) & CONFIG["malicious_cwes"] for f in fs),
+            fix_versions=sorted({f.fixed_version for f in fs if f.fixed_version}),
             reasons=top.reasons,
         ))
     groups.sort(key=lambda g: (g.priority, -(g.top_cvss or 0)))
@@ -364,7 +355,7 @@ def group_by_package(findings: list[Finding]) -> list[PackageGroup]:
 # Reporting
 # ---------------------------------------------------------------------------
 def _sev_bucket(s: str) -> str:
-    """Normalize this scanner's severity vocab to critical/high/medium/low."""
+    """Normalize Trivy severity vocab to critical/high/medium/low."""
     s = (s or "").lower()
     if s == "moderate":
         return "medium"
@@ -403,31 +394,14 @@ def comparison_table(findings: list[Finding]) -> str:
     return _render_comparison(findings, _sev_bucket)
 
 
-def aggregate_threat(findings: list[Finding]) -> dict:
-    """EPSS aggregate threat (FIRST EPSS User Guide, sec.3): scale per-CVE EPSS to
-    'what is the probability that AT LEAST ONE of these is exploited'.
-    Independence => P(>=1) = 1 - product(1 - EPSS_i). KEV findings are excluded:
-    they are already confirmed exploited, not a probability."""
-    probs = [f.epss for f in findings if f.epss is not None and not f.kev]
-    p_none = 1.0
-    for e in probs:
-        p_none *= (1.0 - e)
-    return {"count": len(probs), "p_at_least_one": (1.0 - p_none) if probs else 0.0}
-
-
 def summarize(findings: list[Finding], mode: str) -> dict:
     from collections import Counter
-    agg = aggregate_threat(findings)
     return {
         "exposure_mode": mode,
         "total_findings": len(findings),
         "by_priority": dict(Counter(f.priority.name for f in findings)),
-        "cve_recovered": sum(1 for f in findings if f.cve),
+        "cve_present": sum(1 for f in findings if f.cve),
         "no_cve": sum(1 for f in findings if not f.cve),
-        "epss_aggregate_threat": {
-            "vulns_scored_excl_kev": agg["count"],
-            "prob_at_least_one_exploited_30d": round(agg["p_at_least_one"], 4),
-        },
     }
 
 
@@ -438,12 +412,13 @@ def signals_then_verdict(findings: list[Finding]) -> str:
         cvss = f"{f.cvss}" if f.cvss is not None else "n/a"
         epss = f"{f.epss:.2%}" if f.epss is not None else "n/a"
         kev = "YES" if f.kev else "no"
-        lines.append(f"{f.package}  ({f.advisory_id})")
+        lines.append(f"{f.package} {f.installed_version}  ({f.advisory_id})")
         lines.append(f"    CVE  : {cve}")
         lines.append(f"    CVSS : {cvss}")
         lines.append(f"    EPSS : {epss}")
         lines.append(f"    KEV  : {kev}")
         lines.append(f"    AV   : {f.attack_vector}")
+        lines.append(f"    FIX  : {f.fixed_version or 'none'}")
         lines.append(f"    --> VERDICT: P{f.priority}  ({f.priority.label})")
         for r in f.reasons:
             lines.append(f"        reason: {r}")
@@ -452,7 +427,7 @@ def signals_then_verdict(findings: list[Finding]) -> str:
 
 
 # ===========================================================================
-# STEP 5 — JSON output (filtered-result.json)
+# STEP 5 — JSON output (filtered-sbom.json)
 # ===========================================================================
 def finding_to_dict(f: Finding) -> dict:
     d = asdict(f)
@@ -462,7 +437,7 @@ def finding_to_dict(f: Finding) -> dict:
 
 
 def write_filtered_json(findings: list[Finding], mode: str,
-                        path: str = "filtered-result.json") -> str:
+                        path: str = "filtered-sbom.json") -> str:
     out = {
         "exposure_mode": mode,
         "summary": summarize(findings, mode),
@@ -476,6 +451,7 @@ def write_filtered_json(findings: list[Finding], mode: str,
                 "top_cvss": g.top_cvss,
                 "any_kev": g.any_kev,
                 "any_malicious": g.any_malicious,
+                "fix_versions": g.fix_versions,
                 "reasons": g.reasons,
             }
             for g in group_by_package(findings)
@@ -489,7 +465,7 @@ def write_filtered_json(findings: list[Finding], mode: str,
 # ===========================================================================
 # Driver
 # ===========================================================================
-def run(path: str = "report.json", enricher: Enricher | None = None,
+def run(path: str = "SBOM.json", enricher: Enricher | None = None,
         mode: str = DEFAULT_MODE):
     report = load_report(path)                 # step 1
     findings = extract_signals(report)         # step 2
@@ -497,19 +473,22 @@ def run(path: str = "report.json", enricher: Enricher | None = None,
         enricher = build_live_enricher(findings)
     for f in findings:
         enricher.enrich(f)
-        assign_priority(f, mode=mode)          # step 3 (4-stage model)
+        assign_priority(f, mode=mode)          # step 3 + step 4
     findings.sort(key=lambda x: (x.priority, -(x.cvss or 0)))
     return findings
 
 
 def _parse_mode(argv: list[str]) -> str:
     for i, a in enumerate(argv):
-        m = None
         if a == "--mode" and i + 1 < len(argv):
             m = argv[i + 1]
-        elif a.startswith("--mode="):
+            if m not in EXPOSURE_MODES:
+                print(f"[warn] unknown mode '{m}'; using '{DEFAULT_MODE}'. "
+                      f"Choices: {', '.join(EXPOSURE_MODES)}", file=sys.stderr)
+                return DEFAULT_MODE
+            return m
+        if a.startswith("--mode="):
             m = a.split("=", 1)[1]
-        if m is not None:
             if m not in EXPOSURE_MODES:
                 print(f"[warn] unknown mode '{m}'; using '{DEFAULT_MODE}'. "
                       f"Choices: {', '.join(EXPOSURE_MODES)}", file=sys.stderr)
@@ -519,50 +498,55 @@ def _parse_mode(argv: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Self-check — one assertion per stage of the model.
+# Self-check — covers only the SBOM-specific logic (Trivy parser + CVSS pick),
+# since the prioritization engine is shared with sca-logic.py.
 # ---------------------------------------------------------------------------
 def demo() -> None:
-    def mk(**kw):
-        base = dict(package="p", advisory_id="CVE-x", source="", severity="high",
-                    cvss=None, attack_vector="NETWORK", cwes=[])
-        base.update(kw)
-        return Finding(**base)
+    # _pick_cvss: prefers nvd, parses AV from its vector
+    block = {
+        "ghsa":   {"V3Vector": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H", "V3Score": 6.2},
+        "redhat": {"V3Vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "V3Score": 9.1},
+        "nvd":    {"V3Vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", "V3Score": 7.5},
+    }
+    score, av = _pick_cvss(block)
+    assert score == 7.5 and av == "NETWORK", (score, av)          # nvd wins
+    # falls through to ghsa when nvd absent
+    score, av = _pick_cvss({"ghsa": block["ghsa"], "redhat": block["redhat"]})
+    assert score == 6.2 and av == "LOCAL", (score, av)            # ghsa beats redhat
+    # missing vector -> NONE
+    assert _pick_cvss({"nvd": {"V3Score": 5.0}}) == (5.0, "NONE")
+    # no V3Score anywhere -> (None, NONE)
+    assert _pick_cvss({"nvd": {"V2Score": 5.0}}) == (None, "NONE")
 
-    # Stage 1: KEV override -> P1, immune to a non-network downgrade
-    f = mk(kev=True, attack_vector="LOCAL", cvss=2.0, epss=0.0)
-    assign_priority(f, mode="network_focused")
-    assert f.priority == Priority.P1, f.priority
-    # Stage 1: CWE-506 override -> P1
-    assert assign_priority(mk(cwes=["CWE-506"], cvss=None)).priority == Priority.P1
+    # _recover_cve: VulnerabilityID is the CVE
+    assert _recover_cve("CVE-2025-27789", {}) == "CVE-2025-27789"
+    # GHSA-only id, CVE hidden in references
+    assert _recover_cve("GHSA-xxxx", {"References": ["see CVE-2024-12345"]}) == "CVE-2024-12345"
+    # no CVE recoverable
+    assert _recover_cve("GHSA-yyyy", {"VendorIDs": ["GHSA-yyyy"]}) is None
 
-    # Stage 2: CVSS x EPSS both gates -> P1; one gate missing -> not P1
-    assert assign_priority(mk(cvss=9.8, epss=0.90)).priority == Priority.P1
-    # Stage 2: no EPSS -> severity fallback (high -> P2)
-    assert assign_priority(mk(cvss=None, epss=None, severity="high")).priority == Priority.P2
+    # extract_signals end-to-end on a minimal Trivy shape
+    rep = {"Results": [{"Vulnerabilities": [{
+        "VulnerabilityID": "CVE-2025-0001", "PkgName": "lodash",
+        "InstalledVersion": "1.0.0", "FixedVersion": "1.0.1",
+        "Severity": "MEDIUM", "SeveritySource": "ghsa", "CweIDs": ["CWE-1333"],
+        "CVSS": {"nvd": {"V3Vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H", "V3Score": 7.5}},
+    }]}]}
+    fs = extract_signals(rep)
+    assert len(fs) == 1
+    f = fs[0]
+    assert f.package == "lodash" and f.cve == "CVE-2025-0001"
+    assert f.cvss == 7.5 and f.attack_vector == "NETWORK"
+    assert f.fixed_version == "1.0.1"
 
-    # Floor: CVSS >= 9 never falls below P2, even when EPSS is far too low
-    assert assign_priority(mk(cvss=9.8, epss=0.05)).priority == Priority.P2   # would be P4, floored
-    assert assign_priority(mk(cvss=9.0, epss=0.00)).priority == Priority.P2
-    # Floor also holds after the exposure downgrade (critical + LOCAL, network_focused -2)
-    assert assign_priority(mk(cvss=9.8, epss=0.90, attack_vector="LOCAL"),
-                           mode="network_focused").priority == Priority.P2
-    # Below the floor (CVSS < 9) is unaffected: low EPSS still drops to P4
-    assert assign_priority(mk(cvss=7.5, epss=0.05)).priority == Priority.P4
-
-    # Stage 3: engine P1 degrades on non-network AV (balanced = -1)
-    f = mk(cvss=9.8, epss=0.90, attack_vector="LOCAL")
-    assign_priority(f, mode="balanced")
-    assert f.priority == Priority.P2, f.priority
-    # Stage 3: vector_agnostic mode disables the downgrade
-    f = mk(cvss=9.8, epss=0.90, attack_vector="LOCAL")
-    assign_priority(f, mode="vector_agnostic")
-    assert f.priority == Priority.P1, f.priority
-
-    # Aggregate threat: FIRST guide example — 100 vulns @ EPSS 0.05 -> 99.4%
-    agg = aggregate_threat([mk(epss=0.05) for _ in range(100)])
-    assert agg["count"] == 100 and round(agg["p_at_least_one"], 3) == 0.994, agg
-    # KEV findings are excluded from the probability
-    assert aggregate_threat([mk(epss=0.5), mk(epss=0.5, kev=True)])["count"] == 1
+    # assign_priority sanity: malicious CWE -> P1, immune to exposure
+    mf = Finding("evil", "CVE-x", "", "low", None, "LOCAL", ["CWE-506"])
+    assign_priority(mf, mode="network_focused")
+    assert mf.priority == Priority.P1
+    # local high-EPSS finding downgraded P1->P2 in balanced
+    lf = Finding("p", "CVE-y", "", "critical", 9.8, "LOCAL", [], epss=0.90)
+    assign_priority(lf, mode="balanced")
+    assert lf.priority == Priority.P2, lf.priority
     print("demo: all assertions passed")
 
 
@@ -575,17 +559,13 @@ if __name__ == "__main__":
     mode = _parse_mode(argv)
     positional = [a for a in argv
                   if not a.startswith("-") and a not in EXPOSURE_MODES]
-    path = positional[0] if positional else "report.json"
+    path = positional[0] if positional else "SBOM.json"
 
     findings = run(path, mode=mode)
 
     print(json.dumps(summarize(findings, mode), indent=2))
     print()
     print(comparison_table(findings))
-    print()
-    agg = aggregate_threat(findings)
-    print(f"AGGREGATE THREAT (EPSS, FIRST guide sec.3): {agg['count']} vulns scored "
-          f"(excl. KEV) -> P(>=1 exploited in 30d) = {agg['p_at_least_one']*100:.1f}%")
     print()
     print(signals_then_verdict(findings))
     print()
@@ -597,8 +577,9 @@ if __name__ == "__main__":
     for g in groups:
         flags = [x for x, on in (("KEV", g.any_kev), ("MALICIOUS", g.any_malicious)) if on]
         flag_str = (" [" + ",".join(flags) + "]") if flags else ""
+        fix = f" fix->{','.join(g.fix_versions)}" if g.fix_versions else ""
         print(f"P{g.priority} {g.package}  ({g.finding_count} findings, "
-              f"top_cvss={g.top_cvss}){flag_str}")
+              f"top_cvss={g.top_cvss}){flag_str}{fix}")
         for r in g.reasons:
             print(f"      - {r}")
 

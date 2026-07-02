@@ -1,0 +1,10 @@
+# Scan outputs and data — never publish (carry engine fingerprints / secrets)
+*.json
+filtered-*.json
+juice-shop-result/
+*.pem
+*-checksum.txt
+*.txt
+# Python
+__pycache__/
+*.pyc
